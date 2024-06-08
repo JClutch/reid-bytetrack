@@ -7,6 +7,26 @@ from ..utils.ops import xywh2ltwh
 from .basetrack import BaseTrack, TrackState
 from .utils import matching
 from .utils.kalman_filter import KalmanFilterXYAH
+import faiss
+import torch
+import matplotlib.pyplot as plt
+import cv2
+from torchvision import transforms
+from torchvision.models import resnet50
+from PIL import Image
+
+
+def create_device():
+    # Select the GPU/CPU to use 
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        # else "mps"
+        # if torch.backends.mps.is_available()
+        else "cpu"
+    )
+    print(f"Using {device} device")
+    return device
 
 
 class STrack(BaseTrack):
@@ -240,15 +260,22 @@ class BYTETracker:
 
     def __init__(self, args, frame_rate=30):
         """Initialize a YOLOv8 object to track objects with given arguments and frame rate."""
+        index = faiss.IndexFlatL2(1000) # build the index
+        index = faiss.IndexIDMap(index)
         self.tracked_stracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
         self.removed_stracks = []  # type: list[STrack]
+        self.faiss = index
+        self.id_to_image = {}
+        self.device = create_device()
+        self.resnet = resnet50(pretrained=True)
 
         self.frame_id = 0
         self.args = args
         self.max_time_lost = int(frame_rate / 30.0 * args.track_buffer)
         self.kalman_filter = self.get_kalmanfilter()
         self.reset_id()
+        
 
     def update(self, results, img=None):
         """Updates object tracker with new detections and returns tracked object bounding boxes."""
@@ -306,6 +333,19 @@ class BYTETracker:
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+            print(f"Bounding box: {det.tlwh}, detection score: {det.score}")
+            x1 = int(det.tlwh[0])
+            y1 = int(det.tlwh[1])
+            x2 = int(det.tlwh[0] + det.tlwh[2])
+            y2 = int(det.tlwh[1] + det.tlwh[3])
+
+            if y2 > y1 and x2 > x1:
+                track_img = img[y1:y2, x1:x2]
+                track_img_rgb = cv2.cvtColor(track_img, cv2.COLOR_BGR2RGB)
+                self.save_person_for_reid(track_img_rgb, track)
+                # Plot the image
+            else:
+                print("The bounding box has a width or height of 0.", x1, y1, x2, y2)   
         # Step 3: Second association, with low score detection boxes association the untrack to the low score detections
         detections_second = self.init_track(dets_second, scores_second, cls_second, img)
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
@@ -339,17 +379,51 @@ class BYTETracker:
             track.mark_removed()
             removed_stracks.append(track)
         # Step 4: Init new stracks
+        max_tracks = 10
         for inew in u_detection:
             track = detections[inew]
             if track.score < self.args.new_track_thresh:
                 continue
-            track.activate(self.kalman_filter, self.frame_id)
-            activated_stracks.append(track)
+            print("frame_id: ", self.frame_id)
+            print("self.tracked_tracks: ", self.tracked_stracks)
+            print("self.lost_stracks: ", self.lost_stracks)
+            print("self.removed_stracks: ", self.removed_stracks)
+            x1 = int(track.tlwh[0])
+            y1 = int(track.tlwh[1])
+            x2 = int(track.tlwh[0] + track.tlwh[2])
+            y2 = int(track.tlwh[1] + track.tlwh[3])
+            track_img = img[y1:y2, x1:x2]
+            track_img_rgb = cv2.cvtColor(track_img, cv2.COLOR_BGR2RGB)
+            if(len(self.tracked_stracks) + len(self.lost_stracks) < max_tracks):
+                track.activate(self.kalman_filter, self.frame_id)
+                activated_stracks.append(track)
+            else:
+                # lost_dists = self.get_dists(self.lost_stracks, [track])
+                # Find the index of the lost track with the smallest distance
+                if len(self.lost_stracks) > 1:
+                    # entering re-id pipeline
+                    # naive approach. We are going to select the closest index that appears in our lost stracks
+                    output = self.reid(track_img_rgb)
+                    found = False
+                    for id in output[0]:
+                        if found:
+                            break
+                        for lost_t in self.lost_stracks:
+                            if id == track.track_id:
+                                lost_t.re_activate(track, self.frame_id, new_id=False)
+                                refind_stracks.append(lost_t)
+                                found = True
+                                break
+                elif len(self.lost_stracks) == 1:
+                    self.lost_stracks[0].re_activate(track, self.frame_id, new_id=False)
+                    refind_stracks.append(self.lost_stracks[0])
+            # track.activate(self.kalman_filter, self.frame_id)
+            # activated_stracks.append(track)
         # Step 5: Update state
-        for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
-                track.mark_removed()
-                removed_stracks.append(track)
+        # for track in self.lost_stracks:
+        #     if self.frame_id - track.end_frame > self.max_time_lost:
+        #         track.mark_removed()
+        #         removed_stracks.append(track)
 
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
@@ -363,6 +437,79 @@ class BYTETracker:
             self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum
 
         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
+
+    def extract_features(self, img):
+        img = Image.fromarray(img)
+        preprocess = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        img_preprocessed = preprocess(img).unsqueeze(0).to(self.device)
+        output = self.resnet(img_preprocessed).cpu().numpy()
+        # img = img.transpose((2, 0, 1))  # Transpose the image
+        # img = torch.from_numpy(img).float().unsqueeze(0).to(self.device)
+        # output = self.resnet(img).cpu().numpy()
+        return output
+    
+    def save_person_for_reid(self, img, track):
+        """Save the image of the person for reid."""
+        features = self.extract_features(img)
+        features = features.reshape((1, -1))  # Reshape the features
+        faiss.normalize_L2(features)
+        print(f"Feature dimensions: {features.shape[1]}, Index dimensions: {self.faiss.d}")  
+        self.faiss.add_with_ids(features, np.array([track.track_id]))
+        print("Number of images in Faiss index: ", self.faiss.ntotal)
+        # Save the image for later retrieval
+        if track.track_id in self.id_to_image:
+            self.id_to_image[track.track_id].append(img)
+        else:
+            self.id_to_image[track.track_id] = [img]
+    
+    def reid(self, img):
+        """Reid the tracked object."""
+        outputs = self.extract_features(img)
+        faiss.normalize_L2(outputs)
+        _, I = self.faiss.search(outputs, 5)
+        print(f"Indices: {I}")
+        print('self.lost_stracks', self.lost_stracks)
+        # combined_stracks = self.tracked_stracks + self.lost_stracks
+        # for stracks in combined_stracks:
+        #     print('stracks.idx', stracks.track_id)
+        #     first_five = self.id_to_image[stracks.track_id][:5]
+            
+            # # Display the queried image
+            # plt.figure(figsize=(10, 2))
+            # plt.subplot(1, 6, 1)
+            # plt.imshow(img)  # Make sure 'img' is defined and is the queried image
+            # plt.title("Queried Image")
+
+            # for i, closest_img in enumerate(first_five, 2):  # Start enumeration from 2
+            #     i = 2 if i == 0 else i
+            #     print('what is i?', i)
+            #     plt.subplot(1, 6, i)
+            #     plt.imshow(closest_img)
+            #     plt.title(f"Idx {stracks.track_id}")
+            # plt.show()    
+
+        # Assuming you have a dictionary `id_to_image` mapping IDs to images
+        closest_images = [self.id_to_image[id][0] for id in I[0]]
+
+        # Display the queried image
+        plt.figure(figsize=(10, 2))
+        plt.subplot(1, 6, 1)
+        plt.imshow(img)
+        plt.title("Queried Image")
+
+        # Display the top 5 closest images
+        for i, closest_img in enumerate(closest_images,2 ):
+            plt.subplot(1, 6, i)
+            plt.imshow(closest_img)
+            plt.title(f"Closest {i-1}")
+
+        plt.show()
+        return I
 
     def get_kalmanfilter(self):
         """Returns a Kalman filter object for tracking bounding boxes."""
