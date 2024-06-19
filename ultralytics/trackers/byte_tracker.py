@@ -331,6 +331,7 @@ class BYTETracker:
                 track.update(det, self.frame_id)
                 activated_stracks.append(track)
             else:
+                print("Reactivating track - 334")
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
             print(f"Bounding box: {det.tlwh}, detection score: {det.score}")
@@ -359,6 +360,7 @@ class BYTETracker:
                 track.update(det, self.frame_id)
                 activated_stracks.append(track)
             else:
+                print("Reactivating track - 363")
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
@@ -379,7 +381,7 @@ class BYTETracker:
             track.mark_removed()
             removed_stracks.append(track)
         # Step 4: Init new stracks
-        max_tracks = 10
+        max_tracks = 8
         for inew in u_detection:
             track = detections[inew]
             if track.score < self.args.new_track_thresh:
@@ -401,15 +403,15 @@ class BYTETracker:
                 # lost_dists = self.get_dists(self.lost_stracks, [track])
                 # Find the index of the lost track with the smallest distance
                 if len(self.lost_stracks) > 1:
-                    # entering re-id pipeline
                     # naive approach. We are going to select the closest index that appears in our lost stracks
-                    output = self.reid(track_img_rgb)
+                    interested_ids = [x.track_id for x in self.lost_stracks]
+                    output = self.reid(track_img_rgb, interested_ids)
                     found = False
                     for id in output[0]:
                         if found:
                             break
                         for lost_t in self.lost_stracks:
-                            if id == track.track_id:
+                            if id == lost_t.track_id:
                                 lost_t.re_activate(track, self.frame_id, new_id=False)
                                 refind_stracks.append(lost_t)
                                 found = True
@@ -467,9 +469,19 @@ class BYTETracker:
         else:
             self.id_to_image[track.track_id] = [img]
     
-    def reid(self, img):
+    def reid(self, img, interested_ids):
         """Reid the tracked object."""
+
+        # for id in interested_ids:
+        #     list_of_images = self.id_to_image[id]
+        #     for images in list_of_images:
+        #         features = self.extract_features(images)
+        #         features = features.reshape((1, -1))
+        #         faiss.normalize_L2(features)
+        #         self.faiss.add_with_ids(features, np.array([id]))
+
         outputs = self.extract_features(img)
+        outputs = outputs.reshape((1, -1))
         faiss.normalize_L2(outputs)
         _, I = self.faiss.search(outputs, 5)
         print(f"Indices: {I}")
@@ -503,12 +515,13 @@ class BYTETracker:
         plt.title("Queried Image")
 
         # Display the top 5 closest images
-        for i, closest_img in enumerate(closest_images,2 ):
+        for i, closest_img in enumerate(closest_images, 2):
             plt.subplot(1, 6, i)
             plt.imshow(closest_img)
             plt.title(f"Closest {i-1}")
 
-        plt.show()
+        # plt.show()
+        # self.faiss.reset()
         return I
 
     def get_kalmanfilter(self):

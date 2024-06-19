@@ -10,4 +10,4 @@ model = YOLO('yolov8n-seg.pt')
 # Perform tracking with the model
  # Tracking with default tracker
 #results = model.track(source="1.mp4", show=True)  # Tracking with ByteTrack tracker
-results = model.track(source="reid/test2.mp4", save=True, show=True, persist=True, tracker="bytetrack.yaml")
+results = model.track(source="reid/trimGame2.mp4", save=True, show=True, persist=True, tracker="bytetrack.yaml", classes=[0])  # Tracking with ByteTrack tracker
